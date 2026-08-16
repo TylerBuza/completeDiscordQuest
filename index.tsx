@@ -359,7 +359,10 @@ function completeQuest(quest: QuestValue) {
         switch (taskName) {
             case "WATCH_VIDEO":
             case "WATCH_VIDEO_ON_MOBILE":
-                const maxFuture = 10, speed = 7, interval = 1;
+                // Advance 1s per tick instead of 7s: keeps the progress bar smooth (small,
+                // frequent steps) rather than jumping in big chunks. The maxFuture buffer caps
+                // how far ahead of real time we can report anyway, so a smaller step costs nothing.
+                const maxFuture = 10, speed = 1, interval = 1;
                 const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
                 let completed = false;
                 const watchVideo = async () => {
