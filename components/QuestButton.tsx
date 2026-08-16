@@ -7,13 +7,15 @@
 import "./QuestButton.css";
 
 import { Flex } from "@components/Flex";
-import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
-import { Tooltip, useEffect, useState } from "@webpack/common";
+import { findByCodeLazy, findComponentByCodeLazy } from "@webpack";
+import { NavigationRouter, Tooltip, useEffect, useState } from "@webpack/common";
 
 import { QuestsStore } from "../stores";
 
 const QuestIcon = findByCodeLazy("\"M7.5 21.7a8.95");
-const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome");
+// The old findByProps("navigateToQuestHome") module was renamed and now throws on lookup,
+// crashing the button. Route through Vencord's NavigationRouter instead — build-independent.
+const navigateToQuestHome = () => NavigationRouter.transitionTo("/quest-home");
 const TopBarButton = findComponentByCodeLazy("badgePosition", "icon");
 const SettingsBarButton = findComponentByCodeLazy("keyboardShortcut", "positionKey");
 const CountBadge = findComponentByCodeLazy("renderBadgeCount", "disableColor");
