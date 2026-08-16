@@ -22,6 +22,12 @@ let completableQuests: QuestValue[] = [];
 const completingQuest = new Map();
 const fakeGames = new Map();
 const fakeApplications = new Map();
+const patchedStoreMethods = new Map<string, Function>();
+
+// Run game/stream spoofs one at a time. Two fake games "running" simultaneously is an obvious
+// bot tell, so PLAY_ON_DESKTOP / STREAM_ON_DESKTOP quests take this lock; the rest wait in queue.
+let activeInjection: string | null = null;
+const injectionQueue: any[] = [];
 
 const CONSENT_WARNING = [
     "Important Notice",
@@ -64,20 +70,6 @@ export default definePlugin({
             }
         },
         {
-            find: "\"RunningGameStore\"",
-            group: true,
-            replacement: [
-                {
-                    match: /}getRunningGames\(\){return/,
-                    replace: "}getRunningGames(){const games=$self.getRunningGames();return games ? games : "
-                },
-                {
-                    match: /}getGameForPID\((\i)\){/,
-                    replace: "}getGameForPID($1){const pid=$self.getGameForPID($1);if(pid){return pid;}"
-                }
-            ]
-        },
-        {
             find: "ApplicationStreamingStore",
             replacement: {
                 match: /}getStreamerActiveStreamMetadata\(\){/,
@@ -91,12 +83,14 @@ export default definePlugin({
             return;
         }
 
+        patchRunningGameStore();
         QuestsStore.addChangeListener(updateQuests);
         updateQuests();
     },
     stop: () => {
         QuestsStore.removeChangeListener(updateQuests);
         stopAllFarming();
+        unpatchRunningGameStore();
     },
 
     renderQuestButtonTopBar() {
@@ -123,24 +117,46 @@ export default definePlugin({
         return questButton;
     },
 
-    getRunningGames() {
-        if (fakeGames.size > 0) {
-            return Array.from(fakeGames.values());
-        }
-    },
-
-    getGameForPID(pid) {
-        if (fakeGames.size > 0) {
-            return Array.from(fakeGames.values()).find(game => game.pid === pid);
-        }
-    },
-
     getStreamerActiveStreamMetadata() {
         if (fakeApplications.size > 0) {
             return Array.from(fakeApplications.values()).at(0);
         }
     }
 });
+
+// Overriding getRunningGames + getGameForPID alone no longer schedules a heartbeat: modern
+// Discord derives quest eligibility from the "visible"/"candidate" views too, and a fake game
+// absent from those sits at 0% forever. Wrap them at runtime (each only if the build exposes
+// it) so the fake game shows up everywhere Discord looks. Mirrors nyxxbit/discord-quest-completer.
+function patchRunningGameStore() {
+    const S: any = RunningGameStore;
+    const fakes = () => Array.from(fakeGames.values());
+
+    const wrap = (name: string, make: (orig: Function) => Function) => {
+        if (typeof S[name] !== "function" || patchedStoreMethods.has(name)) return;
+        const orig = S[name].bind(S);
+        patchedStoreMethods.set(name, S[name]);
+        S[name] = make(orig);
+    };
+
+    wrap("getRunningGames", orig => () => [...orig(), ...fakes()]);
+    wrap("getGameForPID", orig => (pid: number) => fakes().find((g: any) => g.pid === pid) ?? orig(pid));
+    wrap("getVisibleGame", orig => () => fakes()[0] ?? orig());
+    wrap("getVisibleRunningGames", orig => () => [...orig(), ...fakes()]);
+    wrap("getCandidateGames", orig => () => [...orig(), ...fakes()]);
+    wrap("getRunningDiscordApplicationIds", orig => () => {
+        const ids = orig();
+        const ours = fakes().map((g: any) => String(g.id));
+        // shape varies by build, preserve whichever collection came back
+        return ids instanceof Set ? new Set([...ids, ...ours]) : [...(ids ?? []), ...ours];
+    });
+}
+
+function unpatchRunningGameStore() {
+    const S: any = RunningGameStore;
+    for (const [name, fn] of patchedStoreMethods) S[name] = fn;
+    patchedStoreMethods.clear();
+}
 
 function isQuestEligibleForFarming(quest: QuestValue): boolean {
     const questConfig = quest.config.taskConfig || quest.config.taskConfigV2;
@@ -199,7 +215,12 @@ function updateQuests() {
                 completingQuest.delete(quest.id);
             }
         } else {
-            completeQuest(quest);
+            // Isolate failures: one malformed quest must not abort the whole batch.
+            try {
+                completeQuest(quest);
+            } catch (err) {
+                console.error("Failed to complete quest:", quest.config?.messages?.questName, err);
+            }
         }
     }
     /* console.log("Available quests updated:", availableQuests);
@@ -231,8 +252,26 @@ function stopCompletingAll() {
     console.log("Stopped completing all quests.");
 }
 
+// Free the injection lock held by questId and start the next queued game/stream quest, if any.
+function releaseInjection(questId: string) {
+    if (activeInjection !== questId) return;
+    activeInjection = null;
+    const next = injectionQueue.shift();
+    if (next) {
+        console.log("Starting next queued quest:", next.config?.messages?.questName);
+        try {
+            completeQuest(next);
+        } catch (err) {
+            console.error("Failed to start queued quest:", next.config?.messages?.questName, err);
+            releaseInjection(next.id);
+        }
+    }
+}
+
 function stopAllFarming() {
     stopCompletingAll();
+    activeInjection = null;
+    injectionQueue.length = 0;
 
     if (fakeGames.size > 0) {
         const removedGames = Array.from(fakeGames.values());
@@ -257,10 +296,10 @@ function completeQuest(quest: QuestValue) {
     if (!quest) {
         console.log("You don't have any uncompleted quests!");
     } else {
-        const pid = Math.floor(Math.random() * 30000) + 1000;
+        // Windows NT allocates PIDs as multiples of 4. Random unaligned PIDs are a spoof tell;
+        // cherry-picked from nyxxbit/discord-quest-completer (tasks.ts: rnd(2500,12500)*4).
+        const pid = (Math.floor(Math.random() * 10000) + 2500) * 4;
 
-        const applicationId = quest.config.application.id;
-        const applicationName = quest.config.application.name;
         const { questName } = quest.config.messages;
         const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
         const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => taskConfig.tasks[x] != null);
@@ -268,12 +307,32 @@ function completeQuest(quest: QuestValue) {
             console.log("Unknown task type for quest:", questName);
             return;
         }
+        // taskConfigV2 moved the app off config.application onto the task (tasks[key].applications[]).
+        // Reading the legacy path crashes on newer quests; fall back through both.
+        // Optional: video/activity tasks carry no application, and reading .id off undefined
+        // used to throw and kill the whole updateQuests loop, starving every quest after it.
+        const application = taskConfig.tasks[taskName]?.applications?.[0] ?? quest.config.application;
+        const applicationId = application?.id;
+        const applicationName = application?.name;
         const secondsNeeded = taskConfig.tasks[taskName].target;
         let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
         if (!isApp && taskName !== "WATCH_VIDEO" && taskName !== "WATCH_VIDEO_ON_MOBILE") {
             console.log("This no longer works in browser for non-video quests (" + taskName + "). Use the discord desktop app to complete the", questName, "quest!");
             return;
+        }
+
+        // Serialize the game/stream spoofs: only one fake process may "run" at a time.
+        if (taskName === "PLAY_ON_DESKTOP" || taskName === "STREAM_ON_DESKTOP") {
+            if (activeInjection !== null && activeInjection !== quest.id) {
+                if (!injectionQueue.some(q => q.id === quest.id)) {
+                    injectionQueue.push(quest);
+                    completingQuest.set(quest.id, true); // mark busy so updateQuests won't re-enqueue
+                    console.log(`Queued ${questName} — waiting for the current game quest to finish.`);
+                }
+                return;
+            }
+            activeInjection = quest.id;
         }
 
         completingQuest.set(quest.id, true);
@@ -360,11 +419,16 @@ function completeQuest(quest: QuestValue) {
                                 console.log("Quest completed!");
                                 completingQuest.set(quest.id, false);
                             }
+                            releaseInjection(quest.id);
                         }
                     };
                     FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
                     console.log(`Spoofed your game to ${applicationName}. Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
+                }).catch(err => {
+                    console.error("Failed to spoof game for quest:", questName, err);
+                    completingQuest.set(quest.id, false);
+                    releaseInjection(quest.id);
                 });
                 break;
 
@@ -392,6 +456,7 @@ function completeQuest(quest: QuestValue) {
                             console.log("Quest completed!");
                             completingQuest.set(quest.id, false);
                         }
+                        releaseInjection(quest.id);
                     }
                 };
                 FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
