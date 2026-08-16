@@ -9,9 +9,22 @@
 
 # CompleteDiscordQuest for Vencord
 
+> [!NOTE]
+> **This is an actively maintained fork.** The upstream repository [nicola02nb/completeDiscordQuest](https://github.com/nicola02nb/completeDiscordQuest) no longer receives updates, so this fork ([osyduck/completeDiscordQuest](https://github.com/osyduck/completeDiscordQuest)) carries the fixes needed to keep the plugin working on current Discord builds.
+
 This is a porting of the original BetterDiscord(BD) plugin [CompleteDiscordQuest](https://github.com/nicola02nb/BetterDiscord-Stuff/tree/main/Plugins/CompleteDiscordQuest).
 
 A Vencord(VC) plugin that completes you multiple discord quests in background simultaneously.
+
+## Changes in this fork:
+
+- Fixed quest completion crashing on newer `taskConfigV2` quests (app moved off `config.application`)
+- Store spoof rewritten as runtime wrappers over `getRunningGames` / `getGameForPID` / `getVisibleGame` / `getVisibleRunningGames` / `getCandidateGames` / `getRunningDiscordApplicationIds` — modern Discord derives quest eligibility from the visible/candidate views, so the old two-method patch left quests stuck at 0%
+- Game/stream spoofs now run one at a time (queued) instead of all at once, to avoid the "playing several games simultaneously" bot tell
+- Spoofed process reports the game's real on-disk path when installed, falling back to a path stamped with the real Windows username
+- PIDs generated as multiples of 4 (Windows NT alignment)
+- Spoofed process stops as soon as its quest completes or expires
+- Quest button navigation fixed (renamed `navigateToQuestHome` module)
 
 ## Credits:
 
