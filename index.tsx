@@ -204,6 +204,21 @@ function updateQuests() {
     availableQuests = [...QuestsStore.quests.values()];
     acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
     completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+
+    // Stop the spoofed process the moment its quest is no longer completable (completed/expired).
+    // The heartbeat handler removes it too, but only if a final beat lands exactly on target;
+    // this reconcile guarantees the fake game/pid disappears as soon as the quest finishes.
+    for (const questId of [...fakeGames.keys()]) {
+        if (!completableQuests.some(q => q.id === questId)) {
+            const fakeGame = fakeGames.get(questId);
+            fakeGames.delete(questId);
+            const games = RunningGameStore.getRunningGames();
+            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: fakeGames.size === 0 ? games : [], games });
+            completingQuest.set(questId, false);
+            releaseInjection(questId);
+        }
+    }
+
     for (const quest of acceptableQuests) {
         if (isQuestEligibleForFarming(quest)) {
             acceptQuest(quest);
