@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import definePlugin from "@utils/types";
+import definePlugin, { PluginNative } from "@utils/types";
 import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { FluxDispatcher, RestAPI } from "@webpack/common";
+
+const Native = VencordNative.pluginHelpers.CompleteDiscordQuest as PluginNative<typeof import("./native")>;
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
@@ -394,14 +396,22 @@ function completeQuest(quest: QuestValue) {
                 break;
 
             case "PLAY_ON_DESKTOP":
-                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(res => {
+                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(async res => {
                     const appData = res.body[0];
                     const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">","") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
 
+                    // Prefer the game's real on-disk path (reflects the actual install location,
+                    // casing and Windows user). Fall back to a username-stamped profile path when
+                    // the game isn't installed. Native only exists in the desktop app.
+                    const real = isApp ? await Native.resolveGamePath(exeName, appData.name).catch(() => null) : null;
+                    const username = isApp ? await Native.getUsername().catch(() => "user") : "user";
+                    const cmdLine = real?.cmdLine ?? `C:\\Users\\${username}\\AppData\\Local\\${appData.name}\\${exeName}`;
+                    const exePath = real?.exePath ?? `c:/users/${username.toLowerCase()}/appdata/local/${appData.name.toLowerCase()}/${exeName}`;
+
                     const fakeGame = {
-                        cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                        cmdLine,
                         exeName,
-                        exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                        exePath,
                         hidden: false,
                         isLauncher: false,
                         id: applicationId,
