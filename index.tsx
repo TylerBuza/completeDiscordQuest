@@ -17,6 +17,11 @@ import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
+const fetchCurrentQuests = findByCodeLazy(
+    "QUESTS_FETCH_CURRENT_QUESTS_BEGIN",
+    "QUESTS_FETCH_CURRENT_QUESTS_SUCCESS",
+    "QUESTS_FETCH_CURRENT_QUESTS_FAILURE"
+) as () => Promise<unknown>;
 // Native claim/CAPTCHA action lookup adapted from the GPL-3.0 project
 // https://github.com/saintordevil/questCompleter
 const claimQuestReward = findByCodeLazy(
@@ -51,9 +56,17 @@ const manualClaimNotifications = new Set<string>();
 const notifiedAchievementQuests = new Set<string>();
 let runtimeGeneration = 0;
 let updateTimer: ReturnType<typeof setTimeout> | undefined;
+let questRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+let questRefreshInFlight: Promise<boolean> | null = null;
+let cancelQuestRefresh: (() => void) | null = null;
+let lastQuestRefreshAt = 0;
+let questRefreshScheduleId = 0;
 let nextClaimAttempt = 0;
 
 const TASK_ORDER = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
+const QUEST_REFRESH_COOLDOWN_MS = 5 * 60_000;
+const QUEST_REFRESH_BASE_MS = 60 * 60_000;
+const QUEST_REFRESH_JITTER_MS = 15 * 60_000;
 
 const CONSENT_WARNING = [
     "Important Notice",
@@ -111,9 +124,14 @@ export default definePlugin({
 
         patchRunningGameStore();
         QuestsStore.addChangeListener(updateQuests);
+        FluxDispatcher.subscribe("CONNECTION_OPEN", handleConnectionOpen);
+        FluxDispatcher.subscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", handleNativeQuestRefreshSuccess);
         updateQuests();
+        scheduleQuestRefresh(5000, true);
     },
     stop: () => {
+        FluxDispatcher.unsubscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", handleNativeQuestRefreshSuccess);
+        FluxDispatcher.unsubscribe("CONNECTION_OPEN", handleConnectionOpen);
         QuestsStore.removeChangeListener(updateQuests);
         stopAllFarming();
         unpatchRunningGameStore();
@@ -256,6 +274,79 @@ function ensureHasAcceptedToUsePlugin(): boolean {
     }
 
     return accepted;
+}
+
+function handleConnectionOpen() {
+    scheduleQuestRefresh(5000, true);
+}
+
+function handleNativeQuestRefreshSuccess() {
+    lastQuestRefreshAt = Date.now();
+    scheduleQuestRefresh();
+}
+
+function scheduleQuestRefresh(delay = QUEST_REFRESH_BASE_MS + Math.random() * QUEST_REFRESH_JITTER_MS, force = false) {
+    clearTimeout(questRefreshTimer);
+    const generation = runtimeGeneration;
+    const scheduleId = ++questRefreshScheduleId;
+    questRefreshTimer = setTimeout(async () => {
+        questRefreshTimer = undefined;
+        const refreshed = await refreshCurrentQuests(force);
+        if (generation === runtimeGeneration && scheduleId === questRefreshScheduleId) {
+            scheduleQuestRefresh(refreshed ? undefined : QUEST_REFRESH_COOLDOWN_MS);
+        }
+    }, delay);
+}
+
+async function refreshCurrentQuests(force: boolean): Promise<boolean> {
+    if (questRefreshInFlight) return questRefreshInFlight;
+    if (!force && Date.now() - lastQuestRefreshAt < QUEST_REFRESH_COOLDOWN_MS) return true;
+
+    const generation = runtimeGeneration;
+    lastQuestRefreshAt = Date.now();
+    questRefreshInFlight = (async () => {
+        console.log("Refreshing Discord quest data.");
+        const refreshed = await new Promise<boolean>(resolve => {
+            let settled = false;
+            const finish = (success: boolean) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                FluxDispatcher.unsubscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", onSuccess);
+                FluxDispatcher.unsubscribe("QUESTS_FETCH_CURRENT_QUESTS_FAILURE", onFailure);
+                if (cancelQuestRefresh === cancel) cancelQuestRefresh = null;
+                resolve(success);
+            };
+            const onSuccess = () => finish(true);
+            const onFailure = () => finish(false);
+            const cancel = () => finish(false);
+            const timeout = setTimeout(() => finish(false), 30_000);
+
+            cancelQuestRefresh = cancel;
+            FluxDispatcher.subscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", onSuccess);
+            FluxDispatcher.subscribe("QUESTS_FETCH_CURRENT_QUESTS_FAILURE", onFailure);
+            try {
+                void Promise.resolve(fetchCurrentQuests()).catch(onFailure);
+            } catch {
+                onFailure();
+            }
+        });
+
+        if (!refreshed) {
+            lastQuestRefreshAt = 0;
+            if (generation === runtimeGeneration) {
+                console.warn("Failed to refresh Discord quest data; retrying in five minutes.");
+            }
+        } else if (generation === runtimeGeneration) {
+            scheduleQuestUpdate();
+        }
+        return refreshed;
+    })();
+    try {
+        return await questRefreshInFlight;
+    } finally {
+        questRefreshInFlight = null;
+    }
 }
 
 function updateQuests() {
@@ -548,6 +639,12 @@ function stopAllFarming() {
     activeRunId++;
     clearTimeout(updateTimer);
     updateTimer = undefined;
+    clearTimeout(questRefreshTimer);
+    questRefreshTimer = undefined;
+    questRefreshScheduleId++;
+    cancelQuestRefresh?.();
+    cancelQuestRefresh = null;
+    lastQuestRefreshAt = 0;
     stopCompletingAll();
     activeQuest = null;
 

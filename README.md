@@ -19,6 +19,7 @@ A Vencord userplugin that completes supported Discord quests one at a time and p
 ## Changes in this fork
 
 - Uses one global queue for video, game, stream, and activity quests instead of completing multiple quests concurrently.
+- Refreshes Discord's native quest store after startup/reconnects and every 60-75 minutes, so opening the Quests tab is not required.
 - Waits for the current reward to be fully claimed before starting the next quest.
 - Processes completed, unclaimed rewards one at a time when Discord starts.
 - Invokes Discord's native reward action so Discord's own CAPTCHA flow appears; the user still completes the CAPTCHA manually.
