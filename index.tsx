@@ -45,6 +45,7 @@ const failedQuests = new Set<string>();
 const finishedTasks = new Map<string, Set<string>>();
 const observedTaskProgress = new Map<string, Map<string, number>>();
 const claimFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const claimSubmissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const claimAttempts = new Map<string, number>();
 const claimAttemptGenerations = new Map<string, number>();
 const settledClaimAttempts = new Set<string>();
@@ -411,6 +412,8 @@ function updateQuests() {
             claimAttemptGenerations.delete(activeQuest);
             settledClaimAttempts.delete(activeQuest);
             inFlightClaims.delete(activeQuest);
+            clearTimeout(claimSubmissionTimers.get(activeQuest));
+            claimSubmissionTimers.delete(activeQuest);
             clearTimeout(claimFallbackTimers.get(activeQuest));
             claimFallbackTimers.delete(activeQuest);
             finishedTasks.delete(activeQuest);
@@ -556,30 +559,46 @@ function announceClaim(quest: QuestValue) {
     const platform = usesInGameModal && Array.isArray(platforms) ? platforms[0] ?? 0 : 0;
     const location = rewardTypes.some(type => [2, 3, 4, 5].includes(type)) ? 11 : 25;
 
-    console.log("Submitting Discord's native reward claim for:", quest.config.messages.questName);
-    void claimQuestReward(quest.id, platform, location)
-        .then(() => {
+    // Quest completion is usually observed inside a Flux dispatch. Defer Discord's action
+    // creator so its QUESTS_CLAIM_REWARD_BEGIN dispatch cannot become a nested dispatch.
+    const submissionTimer = setTimeout(() => {
+        claimSubmissionTimers.delete(quest.id);
+        if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) {
             inFlightClaims.delete(quest.id);
-            if (activeQuest === quest.id) scheduleQuestUpdate();
-            if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
-            const timer = setTimeout(() => {
-                claimFallbackTimers.delete(quest.id);
+            if (claimAttempts.get(quest.id) === attempt) {
+                announcedClaims.delete(quest.id);
+                claimAttempts.delete(quest.id);
+                claimAttemptGenerations.delete(quest.id);
+            }
+            return;
+        }
+
+        console.log("Submitting Discord's native reward claim for:", quest.config.messages.questName);
+        void claimQuestReward(quest.id, platform, location)
+            .then(() => {
+                inFlightClaims.delete(quest.id);
+                if (activeQuest === quest.id) scheduleQuestUpdate();
+                if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
+                const timer = setTimeout(() => {
+                    claimFallbackTimers.delete(quest.id);
+                    if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
+                    settledClaimAttempts.add(quest.id);
+                    const current = QuestsStore.quests.get(quest.id);
+                    if (current) showClaimFallbackOnce(current);
+                }, 5000);
+                claimFallbackTimers.set(quest.id, timer);
+            })
+            .catch(error => {
+                inFlightClaims.delete(quest.id);
+                if (activeQuest === quest.id) scheduleQuestUpdate();
                 if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
                 settledClaimAttempts.add(quest.id);
+                console.error("Discord's native claim was dismissed or failed:", quest.config.messages.questName, error);
                 const current = QuestsStore.quests.get(quest.id);
                 if (current) showClaimFallbackOnce(current);
-            }, 5000);
-            claimFallbackTimers.set(quest.id, timer);
-        })
-        .catch(error => {
-            inFlightClaims.delete(quest.id);
-            if (activeQuest === quest.id) scheduleQuestUpdate();
-            if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
-            settledClaimAttempts.add(quest.id);
-            console.error("Discord's native claim was dismissed or failed:", quest.config.messages.questName, error);
-            const current = QuestsStore.quests.get(quest.id);
-            if (current) showClaimFallbackOnce(current);
-        });
+            });
+    }, 0);
+    claimSubmissionTimers.set(quest.id, submissionTimer);
 }
 
 function showClaimFallbackOnce(quest: QuestValue) {
@@ -698,6 +717,14 @@ function stopAllFarming() {
 
     for (const cleanup of [...activeCleanups.values()]) cleanup();
     activeCleanups.clear();
+    for (const [questId, timer] of claimSubmissionTimers) {
+        clearTimeout(timer);
+        announcedClaims.delete(questId);
+        claimAttempts.delete(questId);
+        claimAttemptGenerations.delete(questId);
+        inFlightClaims.delete(questId);
+    }
+    claimSubmissionTimers.clear();
     for (const timer of claimFallbackTimers.values()) clearTimeout(timer);
     claimFallbackTimers.clear();
     failedQuests.clear();
@@ -854,7 +881,9 @@ function completeQuest(quest: QuestValue) {
                             fakeGames.delete(quest.id);
                             const games = RunningGameStore.getRunningGames();
                             const added = fakeGames.size === 0 ? games : [];
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added, games });
+                            FluxDispatcher.wait(() => {
+                                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added, games });
+                            });
                         }
                         FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
                         if (activeCleanups.get(quest.id) === cleanup) activeCleanups.delete(quest.id);
