@@ -21,7 +21,7 @@ A Vencord userplugin that completes supported Discord quests one at a time and p
 - Uses one global queue for video, game, stream, and activity quests instead of completing multiple quests concurrently.
 - Refreshes Discord's native quest store after startup/reconnects and every 60-75 minutes, so opening the Quests tab is not required.
 - Waits for the current reward to be fully claimed before starting the next quest.
-- Processes completed, unclaimed rewards one at a time when Discord starts.
+- Processes completed, unclaimed rewards one at a time and pauses active farming when a refresh discovers one.
 - Invokes Discord's native reward action so Discord's own CAPTCHA flow appears; the user still completes the CAPTCHA manually.
 - Reports video progress from real elapsed time using the 6-8 second cadence observed in Discord Stable's shipped player code. A fresh 15-minute quest still takes about 15 minutes.
 - Uses Discord Stable's observed activity heartbeat schedule: immediate, then 60 seconds, with the final delay shortened to the remaining duration plus one second.

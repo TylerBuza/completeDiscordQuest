@@ -43,13 +43,16 @@ const activeCleanups = new Map<string, () => void>();
 const enrollingQuests = new Set<string>();
 const failedQuests = new Set<string>();
 const finishedTasks = new Map<string, Set<string>>();
+const observedTaskProgress = new Map<string, Map<string, number>>();
 const claimFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const claimAttempts = new Map<string, number>();
 const claimAttemptGenerations = new Map<string, number>();
 const settledClaimAttempts = new Set<string>();
+const inFlightClaims = new Set<string>();
 
 // Run every quest type through one queue so only one quest progresses at a time.
 let activeQuest: string | null = null;
+let activePhase: "farming" | "reconciling" | "claiming" | null = null;
 let activeRunId = 0;
 const announcedClaims = new Set<string>();
 const manualClaimNotifications = new Set<string>();
@@ -217,7 +220,17 @@ function readUserStatusProgress(userStatus: any, taskName: string): number {
 }
 
 function getTaskProgress(quest: QuestValue, taskName: string): number {
-    return readUserStatusProgress(quest.userStatus, taskName);
+    return Math.max(
+        readUserStatusProgress(quest.userStatus, taskName),
+        observedTaskProgress.get(quest.id)?.get(taskName) ?? 0
+    );
+}
+
+function recordTaskProgress(questId: string, taskName: string, progress: number) {
+    if (!Number.isFinite(progress)) return;
+    const observed = observedTaskProgress.get(questId) ?? new Map<string, number>();
+    observed.set(taskName, Math.max(observed.get(taskName) ?? 0, progress));
+    observedTaskProgress.set(questId, observed);
 }
 
 function isTaskFinished(quest: QuestValue, taskName: string): boolean {
@@ -360,16 +373,35 @@ function updateQuests() {
     notifyCollectibleAchievementQuests();
     acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
     completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+    const pendingClaim = getPendingClaim();
+
+    if (activeQuest && activePhase === "farming" && pendingClaim && pendingClaim.id !== activeQuest) {
+        const current = availableQuests.find(quest => quest.id === activeQuest);
+        if (current && !current.userStatus?.completedAt) {
+            console.log("Pausing the active quest to claim a completed reward first:", pendingClaim.config.messages.questName);
+            completingQuest.set(activeQuest, false);
+            activeCleanups.get(activeQuest)?.();
+            releaseQuest(activeQuest);
+        }
+    }
 
     if (activeQuest) {
         const current = availableQuests.find(q => q.id === activeQuest);
         const rewardExpiresAt = current?.config.rewardsConfig?.rewardsExpireAt;
         const rewardExpired = rewardExpiresAt && new Date(rewardExpiresAt).getTime() <= Date.now();
-        if (!current || rewardExpired || (!current.userStatus?.completedAt && new Date(current.config.expiresAt).getTime() <= Date.now())) {
+        const claimInFlight = inFlightClaims.has(activeQuest);
+        const farmingExpired = activePhase === "farming"
+            && current
+            && !current.userStatus?.completedAt
+            && new Date(current.config.expiresAt).getTime() <= Date.now();
+        if (((!current || rewardExpired) && !claimInFlight) || farmingExpired) {
             completingQuest.set(activeQuest, false);
             activeCleanups.get(activeQuest)?.();
             finishedTasks.delete(activeQuest);
+            observedTaskProgress.delete(activeQuest);
             releaseQuest(activeQuest);
+        } else if (!current) {
+            return;
         } else if (current.userStatus?.claimedAt) {
             completingQuest.set(activeQuest, false);
             activeCleanups.get(activeQuest)?.();
@@ -378,9 +410,11 @@ function updateQuests() {
             claimAttempts.delete(activeQuest);
             claimAttemptGenerations.delete(activeQuest);
             settledClaimAttempts.delete(activeQuest);
+            inFlightClaims.delete(activeQuest);
             clearTimeout(claimFallbackTimers.get(activeQuest));
             claimFallbackTimers.delete(activeQuest);
             finishedTasks.delete(activeQuest);
+            observedTaskProgress.delete(activeQuest);
             releaseQuest(activeQuest);
         } else if (current.userStatus?.completedAt) {
             completingQuest.set(activeQuest, false);
@@ -389,9 +423,9 @@ function updateQuests() {
         }
     }
 
-    // Existing completed rewards take priority at startup and between quests.
+    // Existing completed rewards take priority at startup, after refreshes, and between quests.
     // Keep the global queue paused until each one is claimed, one at a time.
-    if (!activeQuest && startPendingClaim()) return;
+    if (!activeQuest && startPendingClaim(pendingClaim)) return;
 
     // Stop the spoofed process the moment its quest is no longer completable (completed/expired).
     // The heartbeat handler removes it too, but only if a final beat lands exactly on target;
@@ -498,6 +532,7 @@ function notifyCollectibleAchievementQuests() {
 }
 
 function announceClaim(quest: QuestValue) {
+    if (activeQuest === quest.id) activePhase = "claiming";
     if (announcedClaims.has(quest.id)) {
         if (claimAttemptGenerations.get(quest.id) !== runtimeGeneration || settledClaimAttempts.has(quest.id)) {
             showClaimFallbackOnce(quest);
@@ -509,6 +544,7 @@ function announceClaim(quest: QuestValue) {
     const attempt = ++nextClaimAttempt;
     claimAttempts.set(quest.id, attempt);
     claimAttemptGenerations.set(quest.id, generation);
+    inFlightClaims.add(quest.id);
 
     // Discord's own action creator enters its global CAPTCHA interceptor, which
     // opens the challenge over the current channel without navigating to Quests.
@@ -523,6 +559,8 @@ function announceClaim(quest: QuestValue) {
     console.log("Submitting Discord's native reward claim for:", quest.config.messages.questName);
     void claimQuestReward(quest.id, platform, location)
         .then(() => {
+            inFlightClaims.delete(quest.id);
+            if (activeQuest === quest.id) scheduleQuestUpdate();
             if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
             const timer = setTimeout(() => {
                 claimFallbackTimers.delete(quest.id);
@@ -534,6 +572,8 @@ function announceClaim(quest: QuestValue) {
             claimFallbackTimers.set(quest.id, timer);
         })
         .catch(error => {
+            inFlightClaims.delete(quest.id);
+            if (activeQuest === quest.id) scheduleQuestUpdate();
             if (generation !== runtimeGeneration || claimAttempts.get(quest.id) !== attempt) return;
             settledClaimAttempts.add(quest.id);
             console.error("Discord's native claim was dismissed or failed:", quest.config.messages.questName, error);
@@ -556,16 +596,20 @@ function showClaimFallbackOnce(quest: QuestValue) {
     });
 }
 
-function startPendingClaim(): boolean {
-    const pending = availableQuests.find(quest => {
+function getPendingClaim(): QuestValue | undefined {
+    return availableQuests.find(quest => {
         const expiresAt = quest.config.rewardsConfig?.rewardsExpireAt;
         return quest.userStatus?.completedAt
             && !quest.userStatus?.claimedAt
             && (!expiresAt || new Date(expiresAt).getTime() > Date.now());
     });
+}
+
+function startPendingClaim(pending = getPendingClaim()): boolean {
     if (!pending) return false;
 
     activeQuest = pending.id;
+    activePhase = "claiming";
     activeRunId++;
     completingQuest.set(pending.id, false);
     announceClaim(pending);
@@ -590,6 +634,7 @@ function releaseQuest(questId: string, runId?: number) {
     if (activeQuest !== questId || runId != null && activeRunId !== runId) return;
     activeRunId++;
     activeQuest = null;
+    activePhase = null;
     scheduleQuestUpdate();
 }
 
@@ -617,6 +662,8 @@ function finishCurrentTask(quest: QuestValue, taskName: string, runId: number, s
         announceClaim(quest);
         return;
     }
+
+    activePhase = "reconciling";
 
     // Store updates normally confirm completion immediately. Bound the wait so a malformed
     // quest cannot hold the global queue forever after its configured target is reached.
@@ -647,6 +694,7 @@ function stopAllFarming() {
     lastQuestRefreshAt = 0;
     stopCompletingAll();
     activeQuest = null;
+    activePhase = null;
 
     for (const cleanup of [...activeCleanups.values()]) cleanup();
     activeCleanups.clear();
@@ -654,6 +702,7 @@ function stopAllFarming() {
     claimFallbackTimers.clear();
     failedQuests.clear();
     finishedTasks.clear();
+    observedTaskProgress.clear();
 
     if (fakeGames.size > 0) {
         const removedGames = Array.from(fakeGames.values());
@@ -708,6 +757,7 @@ function completeQuest(quest: QuestValue) {
             return;
         }
         activeQuest = quest.id;
+        activePhase = "farming";
         const runId = ++activeRunId;
 
         completingQuest.set(quest.id, true);
@@ -736,7 +786,14 @@ function completeQuest(quest: QuestValue) {
 
                             if (timestamp > secondsDone) {
                                 const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp } });
-                                if (!isCurrentRun(quest.id, runId)) return;
+                                if (!isCurrentRun(quest.id, runId)) {
+                                    const resumableProgress = timestamp >= secondsNeeded
+                                        ? Math.max(0, secondsNeeded - 0.001)
+                                        : timestamp;
+                                    recordTaskProgress(quest.id, taskName, resumableProgress);
+                                    return;
+                                }
+                                recordTaskProgress(quest.id, taskName, timestamp);
                                 secondsDone = timestamp;
                                 if (res.body.completed_at != null || secondsDone >= secondsNeeded) {
                                     console.log("Quest task target reached!");
@@ -818,6 +875,7 @@ function completeQuest(quest: QuestValue) {
                         }
                         armWatchdog();
                         const progress = Math.floor(readUserStatusProgress(event.userStatus, taskName));
+                        recordTaskProgress(quest.id, taskName, progress);
                         console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
                         if (progress >= secondsNeeded) {
@@ -873,6 +931,7 @@ function completeQuest(quest: QuestValue) {
                     }
                     armStreamWatchdog();
                     const progress = Math.floor(readUserStatusProgress(event.userStatus, taskName));
+                    recordTaskProgress(quest.id, taskName, progress);
                     console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
                     if (progress >= secondsNeeded) {
@@ -907,6 +966,7 @@ function completeQuest(quest: QuestValue) {
                             const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: heartbeatBody });
                             if (!isCurrentRun(quest.id, runId)) return;
                             const progress = res.body.progress?.[taskName]?.value ?? 0;
+                            recordTaskProgress(quest.id, taskName, progress);
                             console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
                             if (progress >= secondsNeeded) {
